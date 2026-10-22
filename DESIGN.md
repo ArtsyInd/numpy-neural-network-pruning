@@ -1,91 +1,78 @@
 # Design Notes
 
-## 1. Importance criterion: Taylor approximation
+This document explains the main decisions behind the NumPy neural-network implementation, how I handle pruning and gradients, and what I learned from testing the sparse inference path.
 
-Let a trained model have loss \(L(\mathbf{w})\). Removing a connection with weight \(w_i\) sets it to zero, so the parameter perturbation is \(\Delta w_i=-w_i\). A first-order Taylor expansion gives
+## 1. Why I used a Taylor-based importance score
 
-\[
-L(\mathbf{w}+\Delta w_i) \approx L(\mathbf{w}) + \frac{\partial L}{\partial w_i}\Delta w_i.
-\]
+Magnitude pruning removes weights with the smallest absolute values. It is a useful baseline, but weight size alone does not tell us how much a connection contributes to the loss.
 
-Therefore,
+For this project, I also implemented a first-order Taylor-based score.
 
-\[
-\Delta L_i \approx -w_i\frac{\partial L}{\partial w_i}.
-\]
+Let the model loss be L(w), where w_i is one weight. Removing that connection sets the weight to zero, so the parameter change is:
 
-The signed expression estimates the first-order loss change. For ranking pruning candidates by the magnitude of the estimated effect, use
+Delta w_i = -w_i
 
-\[
-I_i = \left|w_i\frac{\partial L}{\partial w_i}\right|.
-\]
+Using a first-order Taylor approximation:
 
-Connections with smaller scores are considered less consequential under this local approximation. This is a heuristic, not a guarantee: it ignores higher-order terms, interactions among removed connections, and later adaptation during training. Scores can also be noisy if calculated on a single mini-batch. Magnitude pruning instead ranks by \(|w_i|\) and does not account for the loss gradient.
+L(w + Delta w_i) ≈ L(w) + (dL/dw_i) * Delta w_i
 
-## 2. Gradient of a masked weight
+Substituting Delta w_i = -w_i gives:
 
-Let \(m_i\in\{0,1\}\) be a binary mask and let the effective weight be \(\tilde w_i=m_iw_i\). The forward pass uses the effective weight. By the chain rule,
+Delta L_i ≈ -w_i * (dL/dw_i)
 
-\[
-\frac{\partial L}{\partial w_i} = \frac{\partial L}{\partial \tilde w_i}\frac{\partial \tilde w_i}{\partial w_i} = m_i\frac{\partial L}{\partial \tilde w_i}.
-\]
+I use the absolute value of this estimate as the importance score:
 
-For an active connection, the underlying parameter receives the usual gradient. For a masked connection, the gradient with respect to the underlying weight is zero. This is consistent with the forward computation: while the mask is zero, changing that weight cannot change the output or loss. The implementation also enforces exact zero values and prevents optimizers from updating inactive connections. When a mask entry changes, its optimizer state is reset so momentum/variance accumulated under the old mask does not unexpectedly affect the newly active or inactive connection. If a connection is revived, it can receive gradients again after its mask is set to one.
+I_i = |w_i * (dL/dw_i)|
 
-## 3. Autodiff bottlenecks and optimizations
+A smaller score suggests that removing the connection should have a smaller first-order effect on the loss. The score is a heuristic, not a guarantee that the loss will remain unchanged.
 
-This engine prioritizes transparency over throughput. Likely bottlenecks include:
+The approximation ignores higher-order terms and interactions between weights. The result can also depend on the batch used to calculate the gradients. These limitations matter when interpreting the results, especially at high sparsity.
 
-- **Python graph traversal:** each operation creates a tensor node and backward callback; graph ordering and callback dispatch add interpreter overhead.
-- **Many small NumPy operations:** elementwise operations and gradient accumulation can allocate temporary arrays and make many calls instead of using fused kernels.
-- **Gradient storage:** each differentiable tensor may hold a gradient buffer, increasing memory use for large intermediate activations.
-- **Dense matrix multiplication:** NumPy's dense `matmul` is efficient for dense layers but does not automatically exploit zero-valued masked weights.
-- **Sparse inference loops:** Python-level iteration and indexing can cost more than the multiplications saved, especially for small batches and networks.
-- **Finite-difference tests:** numerical gradient checks require repeated forward evaluations and are intended for tests, not training.
+I compare this method with magnitude pruning, which ranks weights using \(|w_i|\) without considering their gradients. Comparing both methods at the same target sparsity helps isolate differences in the pruning criterion.
 
-Potential improvements should be guided by profiling:
+## 2. What happens to gradients when a weight is masked?
 
-1. Profile representative training and inference workloads before optimizing.
-2. Reduce temporary allocations and reuse buffers where safe.
-3. If callback overhead is significant, represent operations with compact metadata rather than a separate closure per operation.
-4. Add vectorized or fused operations and validate their backward rules with numerical gradient tests.
-5. Consider a compiled backend or generated kernels for the computation graph.
-6. Use sparse matrix formats or compiled sparse kernels for inference, selecting formats based on layer shape, sparsity pattern, batch size, and target hardware.
-7. Add numerical and performance regression tests after execution changes.
+Let m_i be a binary mask: 1 means active and 0 means pruned. The effective weight used in the forward pass is:
 
-These are proposed optimizations, not features claimed to be implemented in this repository.
+effective_w_i = m_i * w_i
 
-## 4. Serving a self-pruned model in a multi-tenant inference service
+By the chain rule:
 
-Training and pruning should be separated from online serving.
+dL/dw_i = (dL/d(effective_w_i)) * (d(effective_w_i)/dw_i)
 
-### Offline model build
+Since d(effective_w_i)/dw_i = m_i:
 
-1. Train and prune with versioned data, configuration, random seed, and code revision.
-2. Validate quality, achieved sparsity, numerical equivalence, and any task-specific calibration requirements.
-3. Export immutable artifacts containing weights, masks or sparse matrices, architecture metadata, preprocessing parameters, and a model/version identifier.
-4. Register pruning method, target and achieved sparsity, validation metrics, software versions, and artifact checksum.
-5. Benchmark end-to-end latency and memory at realistic batch sizes on the actual serving hardware before promotion.
+dL/dw_i = m_i * dL/d(effective_w_i)
 
-### Online request path
+When m_i = 1, the underlying weight receives its usual gradient. When m_i = 0, its gradient is zero because changing that weight cannot affect the forward computation while the mask remains zero.
+There is another issue beyond the gradient itself: optimizer state.
 
-- Authenticate the request and resolve the tenant's authorized model version through a tenant-to-model registry.
-- Validate the input schema and apply the preprocessing version associated with that model.
-- Route to workers with the model loaded; batch compatible requests when latency and isolation requirements permit.
-- Return predictions with request and model-version metadata, avoiding unnecessary logging of sensitive payloads.
+Adam maintains moving estimates of gradients and squared gradients. Simply zeroing a weight or its gradient is not enough to guarantee that old optimizer state cannot affect it. My implementation therefore enforces the mask during optimization and resets the relevant optimizer state when a mask entry changes.
 
-### Isolation, scaling, and reliability
+This also matters if a connection is reactivated. Resetting its state prevents momentum or variance accumulated under the previous mask from carrying over unexpectedly.
 
-- Enforce tenant authorization at the API and registry layers; do not trust a client-supplied model identifier without checking access.
-- Apply per-tenant quotas, rate limits, concurrency limits, and bounded queues to prevent noisy-neighbor effects.
-- Cache immutable model artifacts by version and use controlled warm-up and eviction policies.
-- Use health checks, timeouts, safe retry policies, autoscaling, and gradual rollouts with rollback support.
-- Monitor latency percentiles, throughput, errors, memory, queue depth, model version, and prediction/quality drift where labels or suitable feedback are available.
-- Restrict model and tenant-data access, encrypt data in transit and at rest, and maintain appropriate audit trails.
-- For stricter isolation or regulatory requirements, use dedicated workers or separate deployments rather than relying only on tenant IDs in application code.
+The important distinction is that the mask determines whether a connection participates in the forward computation. A pruned weight should remain exactly zero, and optimizer updates should not silently reactivate it.
 
-### Sparse representation choice
+## 3. Autodiff design and performance trade-offs
 
-A binary mask over dense weights guarantees zeroed connections but does not, by itself, reduce dense storage or dense matrix-multiplication cost. If inference speed or memory is a goal, export an actual sparse representation (for example, CSR/CSC for compatible workloads, or structured/block sparsity supported by target hardware). Benchmark the entire path, including conversion, memory movement, batching, and request overhead. The best representation depends on sparsity pattern, dimensions, batch size, hardware, and available kernels.
+The engine uses NumPy operations and stores intermediate tensors and gradient information for backpropagation. Potential bottlenecks include allocating temporary arrays, traversing the computation graph, and repeatedly processing small operations in Python.
 
-This repository is a single-process NumPy experiment and does not implement a production serving service. This section describes a plausible production design, not deployed functionality.
+Possible optimizations include reusing buffers, reducing unnecessary copies, improving graph traversal, and combining compatible operations. Profiling should determine which changes matter most. For larger models, vectorized kernels or an established numerical backend could reduce overhead.
+
+## 4. Multi-Tenant Production Serving
+
+A production service should separate offline model preparation from online inference.
+
+Offline, each model version would be trained, pruned, evaluated, and stored with its weights, masks, configuration, and validation results. Models would be published only after meeting accuracy and resource requirements.
+
+Online, requests would be routed to the correct tenant and model version. Tenant-specific configuration, access controls, resource limits, and monitoring would prevent one tenant from affecting another. Model artifacts should be immutable and versioned to support rollback.
+
+The serving format should match the available hardware. Zero-filled dense weights do not automatically provide faster inference; a sparse representation and compatible kernels are needed to benefit from skipped connections. The current project demonstrates sparse-aware inference, but a scalable multi-tenant service remains a proposed production extension.
+
+## 5. Experimental Evidence
+
+The Pareto experiment compares magnitude and Taylor pruning at target sparsities of 50%, 75%, 90%, and 95%, using five random seeds and an unpruned baseline.
+
+At 90% sparsity, mean test accuracy was 94.33% for Taylor pruning and 90.22% for magnitude pruning. However, the variation across seeds means this result is inconclusive evidence of superiority. At higher sparsity, both methods lose accuracy.
+
+Sparse-aware inference reduced the number of multiplications, but was not consistently faster than dense inference on this small network. The results therefore demonstrate a sparsity–accuracy trade-off, not a general inference-speedup guarantee.
