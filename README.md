@@ -9,39 +9,6 @@ A small neural-network framework implemented with Python and NumPy. The project 
 - **Part 3 — Self-pruning:** binary weight masks, gradual cubic sparsity schedule, magnitude and Taylor importance scores, masked optimizers, optimizer-state resets when mask entries change, and sparse-aware inference.
 - **Part 4 — Evaluation:** multi-seed sparsity sweep, raw and aggregated CSV files, Pareto plot, and a report comparing accuracy with structural and measured inference costs.
 
-## Repository layout
-
-The current scripts are expected to live at the repository root; update this tree if you reorganize them.
-
-```text
-.
-├── tensor.py
-├── layers.py
-├── optim.py
-├── masked_parameter.py
-├── pruning.py
-├── sparse_inference.py
-├── train_part2.py
-├── train_part3.py
-├── run_pareto.py
-├── tests/
-│   ├── test_autodiff.py
-│   ├── test_gradient_checks.py
-│   ├── test_masked_parameter.py
-│   ├── test_masking.py
-│   ├── test_adam.py
-│   ├── test_pruning.py
-│   └── test_part4.py
-├── part4_results/
-│   ├── part4_results_raw.csv
-│   ├── part4_results_summary.csv
-│   ├── part4_pareto.png
-│   └── part4_report.md
-├── requirements.txt
-├── DESIGN.md
-└── README.md
-```
-
 ## Requirements and installation
 
 Python 3.10+ is recommended. The core engine uses NumPy and the standard library; Matplotlib is used to create plots. No PyTorch, TensorFlow, JAX, Keras, or third-party autodiff/pruning library is used.
@@ -104,11 +71,7 @@ Run the Part 1 gradient-check suite:
 python -m unittest discover -s tests -p "test_gradient_checks.py" -v
 ```
 
-The tests cover finite-difference gradient checks and masked-weight behavior, along with optimizer, pruning, and sparse-inference tests. The reported local suite passed 63 tests; rerun it against the final commit before submission.
-
-## Reproduce the experiments
-
-Run commands from the repository root after installing dependencies. If script arguments have changed, confirm them with `python <script>.py --help`.
+The tests cover finite-difference gradient checks and masked-weight behavior, along with optimizer, pruning, and sparse-inference tests. 
 
 ### Part 2 — Baseline MLP training
 
@@ -138,20 +101,11 @@ python run_pareto.py --epochs 300 --targets 0,0.5,0.75,0.9,0.95 --seeds 11,22,33
 
 The sweep runs an unpruned baseline for each seed and both pruning methods at four nonzero sparsity targets. It writes per-run and summary CSVs, a plot, and a Markdown report into `part4_results/`.
 
-Optional quick smoke test (not a replacement for the full experiment):
+Optional quick smoke test:
 
 ```bash
 python run_pareto.py --epochs 10 --targets 0,0.5 --seeds 11 --prune-start-fraction 0.1 --prune-end-fraction 0.8 --prune-every 1 --timing-repeats 2 --output-dir part4_smoke
 ```
-
-## Part 4 results
-
-Commit the generated artifacts so reviewers can inspect both the plot and the underlying measurements:
-
-- [`part4_results_raw.csv`](part4_results/part4_results_raw.csv) — per-seed results.
-- [`part4_results_summary.csv`](part4_results/part4_results_summary.csv) — aggregate means and standard deviations.
-- [`part4_pareto.png`](part4_results/part4_pareto.png) — test accuracy versus achieved sparsity.
-- [`part4_report.md`](part4_results/part4_report.md) — setup, findings, and limitations.
 
 ### Findings from the reported run
 
